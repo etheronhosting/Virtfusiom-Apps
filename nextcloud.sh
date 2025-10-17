@@ -4,113 +4,100 @@ set -euo pipefail
 LOGFILE="/var/log/nextcloud-install.log"
 exec > >(tee -a "$LOGFILE") 2>&1
 
-while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
-      sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
-    sleep 10
-done
-
+# --- Basisinstallatie ---
 apt update -y && apt upgrade -y
-apt install -y docker.io docker-compose curl jq openssl certbot cron dnsutils
+apt install -y docker.io docker-compose curl jq openssl dnsutils
 
+# --- Variabelen ---
 DOMAIN=$(hostname -f)
 IP=$(hostname -I | awk '{print $1}')
-SSL_ENABLED=false
-
-mkdir -p /opt/nextcloud/data
-cd /opt/nextcloud
-
-# --- MariaDB wachtwoord genereren ---
 DB_ROOT_PASS=$(openssl rand -base64 16)
 DB_NAME=nextcloud
 DB_USER=nextcloud
 DB_PASS=$(openssl rand -base64 12)
+EMAIL="admin@$DOMAIN"
 
-# --- SSL aanmaken indien domein resolvable ---
-RESOLVED_IP=$(dig +short "$DOMAIN" | tail -n1)
-if [[ "$RESOLVED_IP" == "$IP" && -n "$RESOLVED_IP" ]]; then
-  if certbot certonly --standalone --non-interactive --agree-tos -m admin@$DOMAIN -d "$DOMAIN"; then
-    SSL_ENABLED=true
-  fi
-fi
+mkdir -p /opt/nextcloud/{db_data,app_data,proxy_data,certs}
+cd /opt/nextcloud
 
-CRT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-KEY_PATH="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-
-if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
-  chmod -R 755 /etc/letsencrypt/live || true
-  chmod -R 755 /etc/letsencrypt/archive || true
-  chmod 644 "$KEY_PATH" || true
-  chmod 644 "$CRT_PATH" || true
-fi
-
-# --- docker-compose.yml genereren ---
+# --- docker-compose.yml ---
 cat <<EOF > docker-compose.yml
 version: "3"
+
 services:
+  nginx-proxy:
+    image: jwilder/nginx-proxy:alpine
+    container_name: nginx-proxy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+      - ./certs:/etc/nginx/certs
+      - ./proxy_data:/usr/share/nginx/html
+      - ./vhost.d:/etc/nginx/vhost.d
+    environment:
+      - DEFAULT_HOST=$DOMAIN
+
+  letsencrypt:
+    image: nginxproxy/acme-companion
+    container_name: nginx-proxy-acme
+    restart: always
+    depends_on:
+      - nginx-proxy
+    environment:
+      - DEFAULT_EMAIL=$EMAIL
+    volumes_from:
+      - nginx-proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./certs:/etc/nginx/certs
+      - ./acme:/etc/acme.sh
+
   db:
     image: mariadb:11
+    container_name: nextcloud-db
     restart: always
     command: --transaction-isolation=READ-COMMITTED --binlog-format=ROW
-    volumes:
-      - db_data:/var/lib/mysql
     environment:
       - MYSQL_ROOT_PASSWORD=$DB_ROOT_PASS
       - MYSQL_DATABASE=$DB_NAME
       - MYSQL_USER=$DB_USER
       - MYSQL_PASSWORD=$DB_PASS
+    volumes:
+      - ./db_data:/var/lib/mysql
 
   app:
     image: nextcloud
+    container_name: nextcloud-app
     restart: always
-    ports:
-EOF
-
-if [ "$SSL_ENABLED" = true ]; then
-cat <<EOF >> docker-compose.yml
-      - "80:80"
-      - "443:443"
+    depends_on:
+      - db
+      - nginx-proxy
+      - letsencrypt
     environment:
-      - NEXTCLOUD_TRUSTED_DOMAINS=$DOMAIN
-      - OVERWRITEPROTOCOL=https
-      - APACHE_DISABLE_REWRITE_IP=1
-      - APACHE_SSL_CERTIFICATE=$CRT_PATH
-      - APACHE_SSL_CERTIFICATE_KEY=$KEY_PATH
-EOF
-else
-cat <<EOF >> docker-compose.yml
-      - "80:80"
-    environment:
-      - NEXTCLOUD_TRUSTED_DOMAINS=$IP
-EOF
-fi
-
-cat <<EOF >> docker-compose.yml
+      - VIRTUAL_HOST=$DOMAIN
+      - LETSENCRYPT_HOST=$DOMAIN
+      - LETSENCRYPT_EMAIL=$EMAIL
       - MYSQL_PASSWORD=$DB_PASS
       - MYSQL_DATABASE=$DB_NAME
       - MYSQL_USER=$DB_USER
       - MYSQL_HOST=db
-    depends_on:
-      - db
+      - NEXTCLOUD_TRUSTED_DOMAINS=$DOMAIN
     volumes:
-      - nextcloud_data:/var/www/html
-volumes:
-  db_data:
-  nextcloud_data:
+      - ./app_data:/var/www/html
 EOF
 
+# --- Start containers ---
 docker-compose down || true
 docker-compose up -d
 systemctl enable docker
 
-# --- SSL auto-renew ---
-if [ "$SSL_ENABLED" = true ]; then
-  (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet && docker-compose -f /opt/nextcloud/docker-compose.yml restart app") | crontab -
-fi
-
 # --- Info ---
 cat <<INFO >/root/nextcloud_info.txt
-Nextcloud geïnstalleerd
-URL: $( [ "$SSL_ENABLED" = true ] && echo "https://$DOMAIN" || echo "http://$IP" )
+Nextcloud is geïnstalleerd en draait achter nginx-proxy.
+URL: https://$DOMAIN
 DB: $DB_NAME
 DB user: $DB_USER
 DB password: $DB_PASS

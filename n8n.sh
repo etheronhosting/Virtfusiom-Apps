@@ -57,7 +57,7 @@ networks:
     driver: bridge
 EOF
 
-docker compose up -d
+docker-compose up -d
 systemctl enable docker
 
 echo "✅ n8n installatie voltooid met Caddy proxy"
